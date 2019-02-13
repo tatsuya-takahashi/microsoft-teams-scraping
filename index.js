@@ -13,6 +13,7 @@ const bodyParser = require("body-parser");
 const request = require("request");
 var app = express();
 var access_token = "";
+var refresh_token = "";
 var messageText = [];
 var fs = require('fs');
 
@@ -40,12 +41,12 @@ var server = app.listen(process.env.port || 3000, function () {
 
 // AD auth param
 var param_auth = {
-    url: `https://login.microsoftonline.com/${loginUrl}/oauth2/v2.0/authorize`, // e.g. hoge.onmicrosoft.com
+    url: "https://login.microsoftonline.com/toyosoft1.onmicrosoft.com/oauth2/v2.0/authorize",
     qs: {
-        client_id: ADClientId,
+        client_id: "{{:clientId}}",
         redirect_uri: "http://localhost:3000/token",
         response_type: "code",
-        scope: "user.read group.readwrite.all user.readwrite.all user.readwrite",
+        scope: "user.read group.readwrite.all user.readwrite.all user.readwrite offline_access",
         state: "1234"
     }
 }
@@ -59,7 +60,7 @@ const param_team = {
 }
 
 // reply param
-const param_team_reply = {
+let param_team_reply = {
     url: "",
     auth: {
         bearer: access_token
@@ -73,11 +74,27 @@ var param_token = {
         "Content-type": "application/x-www-form-urlencoded",
     },
     form: {
-        client_id: ADClientId,
-        client_secret: ADSecret,
+        client_id: "{{:clientId}}",
+        client_secret: "{{:clientSecret}}",
         code: "dummy",
         redirect_uri: "http://localhost:3000/token",
         grant_type: "authorization_code",
+        scope: "user.read"
+    }
+}
+
+// graph token
+var param_token_refresh = {
+    url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    headers: {
+        "Content-type": "application/x-www-form-urlencoded",
+    },
+    form: {
+        client_id: "{{:clientId}}",
+        client_secret: "{{:clientSecret}}",
+        refresh_token: "dummy",
+        redirect_uri: "http://localhost:3000/token",
+        grant_type: "refresh_token",
         scope: "user.read"
     }
 }
@@ -118,6 +135,7 @@ app.get("/token", function (req, res, next) {
         // Scraping
         b = JSON.parse(b);
         access_token = b.access_token;
+        refresh_token = b.refresh_token;
         res.redirect('http://localhost:3000/teams')
     })
 
@@ -133,7 +151,7 @@ app.get("/teams", async function (req, res, next) {
     // 全チーム取得
     res.send("now scraping...");
     param_team.auth.bearer = access_token;
-    param_team_reply.bearer = access_token;
+    param_team_reply.auth.bearer = access_token;
     param_team.url = "https://graph.microsoft.com/beta/groups?$filter=resourceProvisioningOptions/Any(x:x eq 'Team')";
     request.get(param_team, async (e, r, teams) => {
         teams = JSON.parse(teams).value;
@@ -170,11 +188,15 @@ app.get("/teams", async function (req, res, next) {
         executePromises = [];
 
         for (team of teamlist) {
+
             console.log(team.teamName + "is scraping..")
             for (channel of team.channels) {
                 // 取得
                 await getMessageRecursiveAsync(team.teamId, team.teamName, channel.channelId, channel.channelName);
             }
+
+            // 1チーム終わるたびにReflesh
+            await refreshToken();
         }
 
         allText = "teamId\tteamName\tchannelId\tchannelName\tuserId\tname\tcontent";
@@ -186,12 +208,29 @@ app.get("/teams", async function (req, res, next) {
             allText += "\t" + msg.userId;
             allText += "\t" + msg.name;
             allText += "\t" + msg.content;
+            allText += "\t" + msg.date;
         }
         fs.writeFileSync('teams.tsv', allText);
         console.log("done!")
 
     })
 });
+
+function refreshToken() {
+    return new Promise(async (resolve, reject) => {
+        // Setting Code
+        param_token_refresh.form.refresh_token = refresh_token;
+
+        // Token更新
+        b = await syncRequestPost(param_token_refresh);
+        b = JSON.parse(b);
+        access_token = b.access_token;
+        refresh_token = b.refresh_token;
+        param_team.auth.bearer = access_token;
+        param_team_reply.auth.bearer = access_token;
+        resolve();
+    })
+}
 
 /**
  * getMessageRecursiveAsync
@@ -214,13 +253,14 @@ async function getMessageRecursiveAsync(teamId, teamName, channelId, channelName
                 } else {
                     // 終了
                     isMessageDone = true;
+                    console.log(JSON.parse(messages));
                     console.log(channelName + "has been readed.")
                 }
                 messages = JSON.parse(messages).value;
 
                 if (messages && messages != undefined) {
                     for (message of messages) {
-                        if (message.from.user) {
+                        if (message.from && message.from.user) {
                             // たまにユーザーがない
                             var id = message.id;
                             var content = message.body.content;
@@ -233,6 +273,7 @@ async function getMessageRecursiveAsync(teamId, teamName, channelId, channelName
                             content = content.replace(/\t/g, ""); // tab
                             var userId = message.from.user.id;
                             var name = message.from.user.displayName;
+                            var date = message.createdDateTime.toString();
                             if (content != "") {
                                 messageText.push({
                                     teamId: teamId,
@@ -241,11 +282,14 @@ async function getMessageRecursiveAsync(teamId, teamName, channelId, channelName
                                     channelName: channelName,
                                     content: content,
                                     userId: userId,
-                                    name: name
+                                    name: name,
+                                    date: date
                                 });
                             }
                             await getReplyMessageRecursiveAsync(teamId, teamName, channelId, channelName, id);
 
+                        } else {
+                            // console.log(message);
                         }
                     }
                 }
@@ -266,7 +310,14 @@ async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channe
     return new Promise(async (resolve, reject) => {
         isMessageDoneReply = false;
 
-        // URL Build
+        // // URL Build
+        // url = "https://graph.microsoft.com/beta/teams/" + teamId + "/channels/" + urlencode(channelId) + "/messages/" + msgId + "/replies";
+        // param_team_reply = {
+        //     url: url,
+        //     auth: {
+        //         bearer: token
+        //     }
+        // }
         param_team_reply.url = "https://graph.microsoft.com/beta/teams/" +
             teamId + "/channels/" + urlencode(channelId) + "/messages/" + msgId + "/replies";
 
@@ -284,7 +335,7 @@ async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channe
 
                 if (messages && messages != undefined) {
                     for (message of messages) {
-                        if (message.from.user) {
+                        if (message.from && message.from.user) {
                             // たまにユーザーがない
                             var content = message.body.content;
                             content = content.replace(/<("[^"]*"|'[^']*'|[^'">])*>/g, ''); // HTML Tag
@@ -295,6 +346,7 @@ async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channe
                             content = content.replace(/\r/g, ""); // return
                             var userId = message.from.user.id;
                             var name = message.from.user.displayName;
+                            var date = message.createdDateTime.toString();
                             if (content != "") {
                                 messageText.push({
                                     teamId: teamId,
@@ -303,13 +355,16 @@ async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channe
                                     channelName: channelName,
                                     content: content,
                                     userId: userId,
-                                    name: name
+                                    name: name,
+                                    date: date
                                 });
                             }
 
                         }
                     }
                 }
+            } else {
+                isMessageDoneReply = true;
             }
 
         }
@@ -326,6 +381,13 @@ function syncRequest(param) {
     })
 }
 
+function syncRequestPost(param) {
+    return new Promise((resolve, reject) => {
+        request.post(param, async (e, r, b) => {
+            resolve(b)
+        })
+    })
+}
 
 function urlencode(str) {
     return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
