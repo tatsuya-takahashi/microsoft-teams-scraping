@@ -15,6 +15,7 @@ var app = express();
 var access_token = "";
 var refresh_token = "";
 var messageText = [];
+var relations = [];
 var fs = require('fs');
 
 // Body Parser
@@ -199,6 +200,7 @@ app.get("/teams", async function (req, res, next) {
             await refreshToken();
         }
 
+        // alltext
         allText = "teamId\tteamName\tchannelId\tchannelName\tuserId\tname\tcontent";
         for (msg of messageText) {
             allText += "\n" + msg.teamId;
@@ -211,6 +213,15 @@ app.get("/teams", async function (req, res, next) {
             allText += "\t" + msg.date;
         }
         fs.writeFileSync('teams.tsv', allText);
+
+        // relation
+        allText = "relationType\tfromUserId\ttoUserId";
+        for (rel of relations) {
+            allText += "\n" + rel.relationType;
+            allText += "\t" + rel.fromUserId;
+            allText += "\t" + rel.toUserId;
+        }
+        fs.writeFileSync('teams_relations.tsv', allText);
         console.log("done!")
 
     })
@@ -286,7 +297,19 @@ async function getMessageRecursiveAsync(teamId, teamName, channelId, channelName
                                     date: date
                                 });
                             }
-                            await getReplyMessageRecursiveAsync(teamId, teamName, channelId, channelName, id);
+
+                            // likeの取得
+                            for (likeUser of message.reactions) {
+                                if (userId != likeUser.user.user.id) {
+                                    relations.push({
+                                        relationType: likeUser.reactionType,
+                                        fromUserId: likeUser.user.user.id,
+                                        toUserId: userId
+                                    });
+                                }
+                            }
+
+                            await getReplyMessageRecursiveAsync(teamId, teamName, channelId, channelName, id, userId);
 
                         } else {
                             // console.log(message);
@@ -306,7 +329,7 @@ async function getMessageRecursiveAsync(teamId, teamName, channelId, channelName
  * getMessageRecursiveAsync
  * @param {*} team[]
  */
-async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channelName, msgId) {
+async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channelName, msgId, replyToUserId) {
     return new Promise(async (resolve, reject) => {
         isMessageDoneReply = false;
 
@@ -358,6 +381,26 @@ async function getReplyMessageRecursiveAsync(teamId, teamName, channelId, channe
                                     name: name,
                                     date: date
                                 });
+                            }
+
+                            // reply
+                            if (userId != replyToUserId) {
+                                relations.push({
+                                    relationType: 'reply',
+                                    fromUserId: userId,
+                                    toUserId: replyToUserId
+                                });
+                            }
+
+                            // likeの取得
+                            for (likeUser of message.reactions) {
+                                if (userId != likeUser.user.user.id) {
+                                    relations.push({
+                                        relationType: likeUser.reactionType,
+                                        fromUserId: likeUser.user.user.id,
+                                        toUserId: userId
+                                    });
+                                }
                             }
 
                         }
